@@ -3,7 +3,7 @@ import {Duplex, Writable, Readable} from 'stream';
 import {ReadStream} from 'fs';
 import {URL, URLSearchParams} from 'url';
 import {Socket} from 'net';
-import {SecureContextOptions, DetailedPeerCertificate} from 'tls';
+import {SecureContextOptions, DetailedPeerCertificate, SecureVersion} from 'tls';
 import http = require('http');
 import {ClientRequest, RequestOptions, IncomingMessage, ServerResponse, request as httpRequest} from 'http';
 import https = require('https');
@@ -187,6 +187,27 @@ export interface HTTPSOptions {
 	key?: SecureContextOptions['key'];
 	certificate?: SecureContextOptions['cert'];
 	passphrase?: SecureContextOptions['passphrase'];
+	ciphers?: string;
+	/*
+	Attempt to use the server's cipher suite preferences instead of the client's
+	*/
+	honorCipherOrder?: boolean;
+	/**
+	 * Optionally set the maximum TLS version to allow. 
+	 * One of 'TLSv1.3', 'TLSv1.2', 'TLSv1.1', or 'TLSv1'. 
+	 * Cannot be specified along with the secureProtocol option, use one or the other. 
+	 * Default: tls.DEFAULT_MAX_VERSION
+	 */
+	maxVersion?: SecureVersion;
+	/**
+	 * Optionally set the minimum TLS version to allow. 
+	 * One of 'TLSv1.3', 'TLSv1.2', 'TLSv1.1', or 'TLSv1'. 
+	 * Cannot be specified along with the secureProtocol option, use one or the other. 
+	 * It is not recommended to use less than TLSv1.2, but it may be required for interoperability. 
+	 * Default: tls.DEFAULT_MIN_VERSION
+	 */
+	minVersion?: SecureVersion;
+
 }
 
 interface NormalizedPlainOptions extends PlainOptions {
@@ -1526,6 +1547,22 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 			if (options.https.passphrase) {
 				requestOptions.passphrase = options.https.passphrase;
+			}
+
+			if (options.https.ciphers) {
+				requestOptions.ciphers = options.https.ciphers;
+			}
+
+			if (options.https.honorCipherOrder) {
+				requestOptions.honorCipherOrder = options.https.honorCipherOrder;
+			}
+
+			if (options.https.minVersion) {
+				requestOptions.minVersion = options.https.minVersion;
+			}
+
+			if (options.https.maxVersion) {
+				requestOptions.maxVersion = options.https.maxVersion;
 			}
 		}
 
