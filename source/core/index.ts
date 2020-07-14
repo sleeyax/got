@@ -188,9 +188,9 @@ export interface HTTPSOptions {
 	certificate?: SecureContextOptions['cert'];
 	passphrase?: SecureContextOptions['passphrase'];
 	ciphers?: string;
-	/*
-	Attempt to use the server's cipher suite preferences instead of the client's
-	*/
+	/**
+	 * Attempt to use the server's cipher suite preferences instead of the client's
+	 */
 	honorCipherOrder?: boolean;
 	/**
 	 * Optionally set the maximum TLS version to allow. 
@@ -207,7 +207,15 @@ export interface HTTPSOptions {
 	 * Default: tls.DEFAULT_MIN_VERSION
 	 */
 	minVersion?: SecureVersion;
-
+	/**
+	 * Legacy mechanism to select the TLS protocol version to use, it does not support independent control of the minimum and maximum version, and does not support limiting the protocol to TLSv1.3. 
+	 * Use minVersion and maxVersion instead. 
+	 * The possible values are listed as SSL_METHODS, use the function names as strings. 
+	 * For example, use 'TLSv1_1_method' to force TLS version 1.1, or 'TLS_method' to allow any TLS protocol version up to TLSv1.3. 
+	 * It is not recommended to use TLS versions less than 1.2, but it may be required for interoperability. 
+	 * Default: none, see minVersion.
+	 */
+	secureProtocol?: string;
 }
 
 interface NormalizedPlainOptions extends PlainOptions {
@@ -1563,6 +1571,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 			if (options.https.maxVersion) {
 				requestOptions.maxVersion = options.https.maxVersion;
+			}
+
+			if (options.https.secureProtocol) {
+				requestOptions.secureProtocol = options.https.secureProtocol;
 			}
 		}
 
