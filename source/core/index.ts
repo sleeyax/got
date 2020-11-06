@@ -66,9 +66,9 @@ export interface Agents {
 export const withoutBody: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 
 export interface ToughCookieJar {
-	getCookieString: ((currentUrl: string, options: {[key: string]: unknown}, cb: (err: Error | null, cookies: string) => void) => void)
+	getCookieString: ((currentUrl: string, options: Record<string, unknown>, cb: (err: Error | null, cookies: string) => void) => void)
 	& ((url: string, callback: (error: Error | null, cookieHeader: string) => void) => void);
-	setCookie: ((cookieOrString: unknown, currentUrl: string, options: {[key: string]: unknown}, cb: (err: Error | null, cookie: unknown) => void) => void)
+	setCookie: ((cookieOrString: unknown, currentUrl: string, options: Record<string, unknown>, cb: (err: Error | null, cookie: unknown) => void) => void)
 	& ((rawCookie: string, url: string, callback: (error: Error | null, result: unknown) => void) => void);
 }
 
@@ -250,7 +250,7 @@ export type RequestFunction = (url: URL, options: RequestOptions, callback?: (re
 export type Headers = Record<string, string | string[] | undefined>;
 
 type CacheableRequestFunction = (
-	opts: string | URL | RequestOptions,
+	options: string | URL | RequestOptions,
 	cb?: (response: ServerResponse | ResponseLike) => void
 ) => CacheableRequest.Emitter;
 
@@ -300,6 +300,13 @@ export interface RequiredRetryOptions {
 	errorCodes: string[];
 	calculateDelay: RetryFunction;
 	maxRetryAfter?: number;
+}
+
+export interface CacheOptions {
+	shared?: boolean;
+	cacheHeuristic?: number;
+	immutableMinTimeToLive?: number;
+	ignoreCargoCult?: boolean;
 }
 
 interface PlainOptions extends URLOptions {
@@ -429,7 +436,7 @@ interface PlainOptions extends URLOptions {
 
 	__Note #2__: This option is not enumerable and will not be merged with the instance defaults.
 	*/
-	form?: {[key: string]: any};
+	form?: Record<string, any>;
 
 	/**
 	JSON body. If the `Content-Type` header is not set, it will be set to `application/json`.
@@ -438,7 +445,7 @@ interface PlainOptions extends URLOptions {
 
 	__Note #2__: This option is not enumerable and will not be merged with the instance defaults.
 	*/
-	json?: {[key: string]: any};
+	json?: Record<string, any>;
 
 	/**
 	The URL to request, as a string, a [`https.request` options object](https://nodejs.org/api/https.html#https_https_request_options_callback), or a [WHATWG `URL`](https://nodejs.org/api/url.html#url_class_url).
@@ -493,7 +500,7 @@ interface PlainOptions extends URLOptions {
 	//=> 'key=a&key=b'
 	```
 	*/
-	searchParams?: string | {[key: string]: string | number | boolean | null | undefined} | URLSearchParams;
+	searchParams?: string | Record<string, string | number | boolean | null | undefined> | URLSearchParams;
 
 	/**
 	An instance of [`CacheableLookup`](https://github.com/szmarczak/cacheable-lookup) used for making DNS lookups.
@@ -508,10 +515,7 @@ interface PlainOptions extends URLOptions {
 	dnsCache?: CacheableLookup | boolean;
 
 	/**
-	User data. In contrast to other options, `context` is not enumerable.
-
-	__Note__: The object is never merged, it's just passed through.
-	Got will not modify the object in any way.
+	User data. `context` is shallow merged and enumerable. If it contains non-enumerable properties they will NOT be merged.
 
 	@example
 	```
@@ -765,10 +769,7 @@ interface PlainOptions extends URLOptions {
 	createConnection?: (options: http.RequestOptions, oncreate: (error: Error, socket: Socket) => void) => Socket;
 
 	// From `http-cache-semantics`
-	shared?: boolean;
-	cacheHeuristic?: number;
-	immutableMinTimeToLive?: number;
-	ignoreCargoCult?: boolean;
+	cacheOptions?: CacheOptions;
 
 	// TODO: remove when Got 12 gets released
 	/**
@@ -849,7 +850,7 @@ export interface HTTPSOptions {
 	If the intermediate certificates are not provided, the peer will not be able to validate the certificate, and the handshake will fail.
 	*/
 	certificate?: SecureContextOptions['cert'];
-
+	
 	/**
 	The passphrase to decrypt the `options.https.key` (if different keys have different passphrases refer to `options.https.key` documentation).
 	*/
@@ -883,6 +884,7 @@ export interface HTTPSOptions {
 	 * Default: none, see minVersion.
 	 */
 	secureProtocol?: string;
+	pfx?: SecureContextOptions['pfx'];
 }
 
 interface NormalizedPlainOptions extends PlainOptions {
@@ -912,6 +914,7 @@ interface NormalizedPlainOptions extends PlainOptions {
 	parseJson: ParseJsonFunction;
 	stringifyJson: StringifyJsonFunction;
 	retry: RequiredRetryOptions;
+	cacheOptions: CacheOptions;
 	[kRequest]: HttpRequestFunction;
 	[kIsNormalizedAlready]?: boolean;
 }
@@ -950,10 +953,7 @@ interface PlainDefaults {
 	createConnection?: Options['createConnection'];
 
 	// From `http-cache-semantics`
-	shared?: boolean;
-	cacheHeuristic?: number;
-	immutableMinTimeToLive?: number;
-	ignoreCargoCult?: boolean;
+	cacheOptions: CacheOptions;
 }
 
 export interface Defaults extends PromiseOnly.Defaults, PlainDefaults {}
@@ -1165,9 +1165,8 @@ const waitForOpenFile = async (file: ReadStream): Promise<void> => new Promise((
 
 const redirectCodes: ReadonlySet<number> = new Set([300, 301, 302, 303, 304, 307, 308]);
 
-type NonEnumerableProperty = 'context' | 'body' | 'json' | 'form';
+type NonEnumerableProperty = 'body' | 'json' | 'form';
 const nonEnumerableProperties: NonEnumerableProperty[] = [
-	'context',
 	'body',
 	'json',
 	'form'
@@ -1248,7 +1247,7 @@ export class RequestError extends Error {
 		this.timings = this.request?.timings;
 
 		// Recover the original stacktrace
-		if (!is.undefined(error.stack)) {
+		if (is.string(error.stack) && is.string(this.stack)) {
 			const indexOfMessage = this.stack.indexOf(this.message) + this.message.length;
 			const thisStackTrace = this.stack.slice(indexOfMessage).split('\n').reverse();
 			const errorStackTrace = error.stack.slice(error.stack.indexOf(error.message!) + error.message!.length).split('\n').reverse();
@@ -1452,17 +1451,27 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			this._lockWrite();
 		}
 
-		(async (nonNormalizedOptions: Options) => {
+		if (kIsNormalizedAlready in options) {
+			this.options = options as NormalizedOptions;
+		} else {
 			try {
-				if (nonNormalizedOptions.body instanceof ReadStream) {
-					await waitForOpenFile(nonNormalizedOptions.body);
+				// @ts-expect-error Common TypeScript bug saying that `this.constructor` is not accessible
+				this.options = this.constructor.normalizeArguments(url, options, defaults);
+			} catch (error) {
+				// TODO: Move this to `_destroy()`
+				if (is.nodeStream(options.body)) {
+					options.body.destroy();
 				}
 
-				if (kIsNormalizedAlready in nonNormalizedOptions) {
-					this.options = nonNormalizedOptions as NormalizedOptions;
-				} else {
-					// @ts-expect-error Common TypeScript bug saying that `this.constructor` is not accessible
-					this.options = this.constructor.normalizeArguments(url, nonNormalizedOptions, defaults);
+				this.destroy(error);
+				return;
+			}
+		}
+
+		(async () => {
+			try {
+				if (this.options.body instanceof ReadStream) {
+					await waitForOpenFile(this.options.body);
 				}
 
 				const {url: normalizedURL} = this.options;
@@ -1502,7 +1511,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 					this.destroy(error);
 				}
 			}
-		})(options);
+		})();
 	}
 
 	static normalizeArguments(url?: string | URL, options?: Options, defaults?: Defaults): NormalizedOptions {
@@ -1558,6 +1567,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		assert.any([isDnsLookupIpVersion, is.undefined], options.dnsLookupIpVersion);
 		assert.any([is.object, is.undefined], options.https);
 		assert.any([is.boolean, is.undefined], options.rejectUnauthorized);
+
 		if (options.https) {
 			assert.any([is.boolean, is.undefined], options.https.rejectUnauthorized);
 			assert.any([is.function_, is.undefined], options.https.checkServerIdentity);
@@ -1565,7 +1575,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			assert.any([is.string, is.object, is.array, is.undefined], options.https.key);
 			assert.any([is.string, is.object, is.array, is.undefined], options.https.certificate);
 			assert.any([is.string, is.undefined], options.https.passphrase);
+			assert.any([is.string, is.buffer, is.array, is.undefined], options.https.pfx);
 		}
+
+		assert.any([is.object, is.undefined], options.cacheOptions);
 
 		// `options.method`
 		if (is.string(options.method)) {
@@ -1632,14 +1645,14 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		options.password = options.password ?? '';
 
 		// `options.prefixUrl` & `options.url`
-		if (options.prefixUrl) {
+		if (is.undefined(options.prefixUrl)) {
+			options.prefixUrl = defaults?.prefixUrl ?? '';
+		} else {
 			options.prefixUrl = options.prefixUrl.toString();
 
 			if (options.prefixUrl !== '' && !options.prefixUrl.endsWith('/')) {
 				options.prefixUrl += '/';
 			}
-		} else {
-			options.prefixUrl = '';
 		}
 
 		if (is.string(options.url)) {
@@ -1653,6 +1666,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 
 		if (options.url) {
+			if ('port' in options) {
+				delete options.port;
+			}
+
 			// Make it possible to change `options.prefixUrl`
 			let {prefixUrl} = options;
 			Object.defineProperty(options, 'prefixUrl', {
@@ -1765,6 +1782,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			}
 		}
 
+		// `options.cacheOptions`
+		options.cacheOptions = {...options.cacheOptions};
+
 		// `options.dnsCache`
 		if (options.dnsCache === true) {
 			options.dnsCache = globalDnsCache;
@@ -1785,9 +1805,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 
 		// `options.context`
-		if (!options.context) {
-			options.context = {};
-		}
+		options.context = {...defaults?.context, ...options.context};
 
 		// `options.hooks`
 		const areHooksDefault = options.hooks === defaults?.hooks;
@@ -1810,7 +1828,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			for (const event of knownHookEvents) {
 				const defaultHooks = defaults.hooks[event];
 
-				if (defaultHooks.length !== 0) {
+				if (defaultHooks.length > 0) {
 					// See https://github.com/microsoft/TypeScript/issues/31445#issuecomment-576929044
 					(options.hooks as any)[event] = [
 						...defaults.hooks[event],
@@ -1852,6 +1870,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 		if ('passphrase' in options) {
 			deprecationWarning('"options.passphrase" was never documented, please use "options.https.passphrase"');
+		}
+
+		if ('pfx' in options) {
+			deprecationWarning('"options.pfx" was never documented, please use "options.https.pfx"');
 		}
 
 		// Other options
@@ -2072,6 +2094,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 				if ('form' in options) {
 					delete options.form;
 				}
+
+				this[kBody] = undefined;
+				delete options.headers['content-length'];
 			}
 
 			if (this.redirects.length >= options.maxRedirects) {
@@ -2089,7 +2114,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 				decodeURI(redirectString);
 
 				// Redirecting to a different site, clear sensitive data.
-				if (redirectUrl.hostname !== url.hostname) {
+				if (redirectUrl.hostname !== url.hostname || redirectUrl.port !== url.port) {
 					if ('host' in options.headers) {
 						delete options.headers.host;
 					}
@@ -2103,12 +2128,12 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 					}
 
 					if (options.username || options.password) {
-						// TODO: Fix this ignore.
-						// @ts-expect-error
-						delete options.username;
-						// @ts-expect-error
-						delete options.password;
+						options.username = '';
+						options.password = '';
 					}
+				} else {
+					redirectUrl.username = options.username;
+					redirectUrl.password = options.password;
 				}
 
 				this.redirects.push(redirectString);
@@ -2204,11 +2229,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			// Node.js <= 12.18.2 mistakenly emits the response `end` first.
 			(request as ClientRequest & {res: IncomingMessage | undefined}).res?.removeAllListeners('end');
 
-			if (error instanceof TimedOutTimeoutError) {
-				error = new TimeoutError(error, this.timings!, this);
-			} else {
-				error = new RequestError(error.message, error, this);
-			}
+			error = error instanceof TimedOutTimeoutError ? new TimeoutError(error, this.timings!, this) : new RequestError(error.message, error, this);
 
 			this._beforeError(error as RequestError);
 		});
@@ -2319,6 +2340,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			}
 		}
 
+		if (options.body && this[kBody] !== options.body) {
+			this[kBody] = options.body;
+		}
+
 		const {agent, request, timeout, url} = options;
 
 		if (options.dnsCache && !('lookup' in options)) {
@@ -2367,7 +2392,11 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		// @ts-expect-error
 		delete options.timeout;
 
-		const requestOptions = options as unknown as RealRequestOptions;
+		const requestOptions = options as unknown as (RealRequestOptions & CacheOptions);
+		requestOptions.shared = options.cacheOptions?.shared;
+		requestOptions.cacheHeuristic = options.cacheOptions?.cacheHeuristic;
+		requestOptions.immutableMinTimeToLive = options.cacheOptions?.immutableMinTimeToLive;
+		requestOptions.ignoreCargoCult = options.cacheOptions?.ignoreCargoCult;
 
 		// If `dnsLookupIpVersion` is not present do not override `family`
 		if (options.dnsLookupIpVersion !== undefined) {
@@ -2423,6 +2452,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			if (options.https.secureProtocol) {
 				requestOptions.secureProtocol = options.https.secureProtocol;
 			}
+
+			if (options.https.pfx) {
+				requestOptions.pfx = options.https.pfx;
+			}
 		}
 
 		try {
@@ -2462,6 +2495,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 				if (options.https.passphrase) {
 					delete requestOptions.passphrase;
+				}
+
+				if (options.https.pfx) {
+					delete requestOptions.pfx;
 				}
 			}
 
@@ -2525,9 +2562,8 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 				try {
 					response.rawBody = await getBuffer(response);
+					response.body = response.rawBody.toString();
 				} catch {}
-
-				response.body = response.rawBody.toString();
 			}
 
 			if (this.listenerCount('retry') !== 0) {
@@ -2637,6 +2673,11 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	}
 
 	_writeRequest(chunk: any, encoding: BufferEncoding | undefined, callback: (error?: Error | null) => void): void {
+		if (this[kRequest]!.destroyed) {
+			// Probably the `ClientRequest` instance will throw
+			return;
+		}
+
 		this._progressCallbacks.push((): void => {
 			this[kUploadedSize] += Buffer.byteLength(chunk, encoding);
 
@@ -2650,7 +2691,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		// TODO: What happens if it's from cache? Then this[kRequest] won't be defined.
 
 		this[kRequest]!.write(chunk, encoding!, (error?: Error | null) => {
-			if (!error && this._progressCallbacks.length !== 0) {
+			if (!error && this._progressCallbacks.length > 0) {
 				this._progressCallbacks.shift()!();
 			}
 
@@ -2727,7 +2768,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	The remote IP address.
 	*/
 	get ip(): string | undefined {
-		return this[kRequest]?.socket.remoteAddress;
+		return this.socket?.remoteAddress;
 	}
 
 	/**
@@ -2738,7 +2779,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	}
 
 	get socket(): Socket | undefined {
-		return this[kRequest]?.socket;
+		return this[kRequest]?.socket ?? undefined;
 	}
 
 	/**

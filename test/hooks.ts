@@ -3,6 +3,7 @@ import {Agent as HttpAgent} from 'http';
 import test, {Constructor} from 'ava';
 import nock = require('nock');
 import getStream = require('get-stream');
+import FormData = require('form-data');
 import sinon = require('sinon');
 import delay = require('delay');
 import {Handler} from 'express';
@@ -15,6 +16,10 @@ const error = new Error(errorString);
 
 const echoHeaders: Handler = (request, response) => {
 	response.end(JSON.stringify(request.headers));
+};
+
+const echoBody: Handler = async (request, response) => {
+	response.end(await getStream(request));
 };
 
 const echoUrl: Handler = (request, response) => {
@@ -421,7 +426,7 @@ test('beforeRetry is called with options', withServer, async (t, server, got) =>
 			beforeRetry: [
 				(options, error, retryCount) => {
 					t.is(options.url.hostname, 'localhost');
-					t.is(options.context, context);
+					t.deepEqual(options.context, context);
 					t.truthy(error);
 					t.true(retryCount! >= 1);
 				}
@@ -445,6 +450,43 @@ test('beforeRetry allows modifications', withServer, async (t, server, got) => {
 		}
 	});
 	t.is(body.foo, 'bar');
+});
+
+test('beforeRetry allows stream body if different from original', withServer, async (t, server, got) => {
+	server.post('/retry', async (request, response) => {
+		if (request.headers.foo) {
+			response.send('test');
+		} else {
+			response.statusCode = 500;
+		}
+
+		response.end();
+	});
+
+	const generateBody = () => {
+		const form = new FormData();
+		form.append('A', 'B');
+		return form;
+	};
+
+	const {body} = await got.post('retry', {
+		body: generateBody(),
+		retry: {
+			methods: ['POST']
+		},
+		hooks: {
+			beforeRetry: [
+				options => {
+					const form = generateBody();
+					options.body = form;
+					options.headers['content-type'] = `multipart/form-data; boundary=${form.getBoundary()}`;
+					options.headers.foo = 'bar';
+				}
+			]
+		}
+	});
+
+	t.is(body, 'test');
 });
 
 test('afterResponse is called with response', withServer, async (t, server, got) => {
@@ -940,7 +982,7 @@ test('beforeRequest hook respect `url` option', withServer, async (t, server, go
 		response.end('ok');
 	});
 
-	t.is((await got(server.sslHostname, {
+	t.is((await got(server.hostname, {
 		hooks: {
 			beforeRequest: [
 				options => {
@@ -1193,4 +1235,22 @@ test('no duplicate hook calls when returning original request options', withServ
 
 	t.is(beforeHookCount, 4);
 	t.is(afterHookCount, 4);
+});
+
+test('`beforeRequest` change body', withServer, async (t, server, got) => {
+	server.post('/', echoBody);
+
+	const response = await got.post({
+		json: {payload: 'old'},
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.body = JSON.stringify({payload: 'new'});
+					options.headers['content-length'] = options.body.length.toString();
+				}
+			]
+		}
+	});
+
+	t.is(JSON.parse(response.body).payload, 'new');
 });
