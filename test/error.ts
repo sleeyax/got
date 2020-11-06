@@ -1,7 +1,10 @@
 import {promisify} from 'util';
+import net = require('net');
 import http = require('http');
 import stream = require('stream');
 import test from 'ava';
+import getStream = require('get-stream');
+import is from '@sindresorhus/is';
 import got, {RequestError, HTTPError, TimeoutError} from '../source';
 import withServer from './helpers/with-server';
 
@@ -35,7 +38,7 @@ test('properties', withServer, async (t, server, got) => {
 test('catches dns errors', async t => {
 	const error = await t.throwsAsync<RequestError>(got('http://doesntexist', {retry: 0}));
 	t.truthy(error);
-	t.regex(error.message, /ENOTFOUND/);
+	t.regex(error.message, /ENOTFOUND|EAI_AGAIN/);
 	t.is(error.options.url.host, 'doesntexist');
 	t.is(error.options.method, 'GET');
 });
@@ -216,6 +219,34 @@ test('promise does not hang on timeout on HTTP error', withServer, async (t, ser
 	});
 });
 
+test('no uncaught parse errors', async t => {
+	const server = net.createServer();
+
+	const listen = promisify(server.listen.bind(server));
+	const close = promisify(server.close.bind(server));
+
+	// @ts-expect-error TS is sooo dumb. It doesn't need an argument at all.
+	await listen();
+
+	server.on('connection', socket => {
+		socket.resume();
+		socket.end([
+			'HTTP/1.1 404 Not Found',
+			'transfer-encoding: chunked',
+			'',
+			'0',
+			'',
+			''
+		].join('\r\n'));
+	});
+
+	await t.throwsAsync(got.head(`http://localhost:${(server.address() as net.AddressInfo).port}`), {
+		message: /^Parse Error/
+	});
+
+	await close();
+});
+
 // Fails randomly on Node 10:
 // Blocked by https://github.com/istanbuljs/nyc/issues/619
 // eslint-disable-next-line ava/no-skip-test
@@ -231,4 +262,71 @@ test.skip('the old stacktrace is recovered', async t => {
 	// The first `at get` points to where the error was wrapped,
 	// the second `at get` points to the real cause.
 	t.not(error.stack!.indexOf('at get'), error.stack!.lastIndexOf('at get'));
+});
+
+test.serial('custom stack trace', withServer, async (t, _server, got) => {
+	const ErrorCaptureStackTrace = Error.captureStackTrace;
+
+	const enable = () => {
+		Error.captureStackTrace = (target: {stack: any}) => {
+			target.stack = [
+				'line 1',
+				'line 2'
+			];
+		};
+	};
+
+	const disable = () => {
+		Error.captureStackTrace = ErrorCaptureStackTrace;
+	};
+
+	// Node.js default behavior
+	{
+		const stream = got.stream('');
+		stream.destroy(new Error('oh no'));
+
+		const caught = await t.throwsAsync(getStream(stream));
+		t.is(is(caught.stack), 'string');
+	}
+
+	// Passing a custom error
+	{
+		enable();
+		const error = new Error('oh no');
+		disable();
+
+		const stream = got.stream('');
+		stream.destroy(error);
+
+		const caught = await t.throwsAsync(getStream(stream));
+		t.is(is(caught.stack), 'string');
+	}
+
+	// Custom global behavior
+	{
+		enable();
+		const error = new Error('oh no');
+
+		const stream = got.stream('');
+		stream.destroy(error);
+
+		const caught = await t.throwsAsync(getStream(stream));
+		t.is(is(caught.stack), 'Array');
+
+		disable();
+	}
+
+	// Passing a default error that needs some processing
+	{
+		const error = new Error('oh no');
+		enable();
+
+		const stream = got.stream('');
+		stream.destroy(error);
+
+		const caught = await t.throwsAsync(getStream(stream));
+		t.is(is(caught.stack), 'Array');
+
+		disable();
+	}
 });

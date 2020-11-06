@@ -25,8 +25,13 @@ import optionsToUrl, {URLOptions} from './utils/options-to-url';
 import WeakableMap from './utils/weakable-map';
 import getBuffer from './utils/get-buffer';
 import {DnsLookupIpVersion, isDnsLookupIpVersion, dnsLookupIpVersionToFamily} from './utils/dns-ip-version';
+import {isResponseOk} from './utils/is-response-ok';
 import deprecationWarning from '../utils/deprecation-warning';
+import normalizePromiseArguments from '../as-promise/normalize-arguments';
 import {PromiseOnly} from '../as-promise/types';
+import calculateRetryDelay from './calculate-retry-delay';
+
+const globalDnsCache = new CacheableLookup();
 
 type HttpRequestFunction = typeof httpRequest;
 type Error = NodeJS.ErrnoException;
@@ -47,6 +52,7 @@ const kTriggerRead = Symbol('triggerRead');
 const kBody = Symbol('body');
 const kJobs = Symbol('jobs');
 const kOriginalResponse = Symbol('originalResponse');
+const kRetryTimeout = Symbol('retryTimeout');
 export const kIsNormalizedAlready = Symbol('isNormalizedAlready');
 
 const supportsBrotli = is.string((process.versions as any).brotli);
@@ -60,9 +66,9 @@ export interface Agents {
 export const withoutBody: ReadonlySet<string> = new Set(['GET', 'HEAD']);
 
 export interface ToughCookieJar {
-	getCookieString: ((currentUrl: string, options: {[key: string]: unknown}, cb: (err: Error | null, cookies: string) => void) => void)
+	getCookieString: ((currentUrl: string, options: Record<string, unknown>, cb: (err: Error | null, cookies: string) => void) => void)
 	& ((url: string, callback: (error: Error | null, cookieHeader: string) => void) => void);
-	setCookie: ((cookieOrString: unknown, currentUrl: string, options: {[key: string]: unknown}, cb: (err: Error | null, cookie: unknown) => void) => void)
+	setCookie: ((cookieOrString: unknown, currentUrl: string, options: Record<string, unknown>, cb: (err: Error | null, cookie: unknown) => void) => void)
 	& ((rawCookie: string, url: string, callback: (error: Error | null, result: unknown) => void) => void);
 }
 
@@ -71,6 +77,9 @@ export interface PromiseCookieJar {
 	setCookie: (rawCookie: string, url: string) => Promise<unknown>;
 }
 
+/**
+All available HTTP request methods provided by Got.
+*/
 export type Method =
 	| 'GET'
 	| 'POST'
@@ -95,20 +104,143 @@ export type InitHook = (options: Options) => void;
 export type BeforeRequestHook = (options: NormalizedOptions) => Promisable<void | Response | ResponseLike>;
 export type BeforeRedirectHook = (options: NormalizedOptions, response: Response) => Promisable<void>;
 export type BeforeErrorHook = (error: RequestError) => Promisable<RequestError>;
+export type BeforeRetryHook = (options: NormalizedOptions, error?: RequestError, retryCount?: number) => void | Promise<void>;
 
 interface PlainHooks {
+	/**
+	Called with plain request options, right before their normalization.
+	This is especially useful in conjunction with `got.extend()` when the input needs custom handling.
+
+	__Note #1__: This hook must be synchronous!
+
+	__Note #2__: Errors in this hook will be converted into an instances of `RequestError`.
+
+	__Note #3__: The options object may not have a `url` property.
+	To modify it, use a `beforeRequest` hook instead.
+
+	@default []
+	*/
 	init?: InitHook[];
+
+	/**
+	Called with normalized request options.
+	Got will make no further changes to the request before it is sent.
+	This is especially useful in conjunction with `got.extend()` when you want to create an API client that, for example, uses HMAC-signing.
+
+	@default []
+	*/
 	beforeRequest?: BeforeRequestHook[];
+
+	/**
+	Called with normalized request options and the redirect response.
+	Got will make no further changes to the request.
+	This is especially useful when you want to avoid dead sites.
+
+	@default []
+
+	@example
+	```
+	const got = require('got');
+
+	got('https://example.com', {
+		hooks: {
+			beforeRedirect: [
+				(options, response) => {
+					if (options.hostname === 'deadSite') {
+						options.hostname = 'fallbackSite';
+					}
+				}
+			]
+		}
+	});
+	```
+	*/
 	beforeRedirect?: BeforeRedirectHook[];
+
+	/**
+	Called with an `Error` instance.
+	The error is passed to the hook right before it's thrown.
+	This is especially useful when you want to have more detailed errors.
+
+	__Note__: Errors thrown while normalizing input options are thrown directly and not part of this hook.
+
+	@default []
+
+	@example
+	```
+	const got = require('got');
+
+	got('https://api.github.com/some-endpoint', {
+		hooks: {
+			beforeError: [
+				error => {
+					const {response} = error;
+					if (response && response.body) {
+						error.name = 'GitHubError';
+						error.message = `${response.body.message} (${response.statusCode})`;
+					}
+
+					return error;
+				}
+			]
+		}
+	});
+	```
+	*/
 	beforeError?: BeforeErrorHook[];
+
+	/**
+	Called with normalized request options, the error and the retry count.
+  Got will make no further changes to the request.
+	This is especially useful when some extra work is required before the next try.
+
+	__Note__: When using streams, this hook is ignored.
+	__Note__: When retrying in a `afterResponse` hook, all remaining `beforeRetry` hooks will be called without the `error` and `retryCount` arguments.
+
+	@default []
+
+	@example
+	```
+	const got = require('got');
+
+	got.post('https://example.com', {
+		hooks: {
+			beforeRetry: [
+				(options, error, retryCount) => {
+					if (error.response.statusCode === 413) { // Payload too large
+						options.body = getNewBody();
+					}
+				}
+			]
+		}
+	});
+	```
+	*/
+	beforeRetry?: BeforeRetryHook[];
 }
 
+/**
+All available hook of Got.
+*/
 export interface Hooks extends PromiseOnly.Hooks, PlainHooks {}
 
-type PlainHookEvent = 'init' | 'beforeRequest' | 'beforeRedirect' | 'beforeError';
+type PlainHookEvent = 'init' | 'beforeRequest' | 'beforeRedirect' | 'beforeError' | 'beforeRetry';
+
+/**
+All hook events acceptable by Got.
+*/
 export type HookEvent = PromiseOnly.HookEvent | PlainHookEvent;
 
-export const knownHookEvents: HookEvent[] = ['init', 'beforeRequest', 'beforeRedirect', 'beforeError'];
+export const knownHookEvents: HookEvent[] = [
+	'init',
+	'beforeRequest',
+	'beforeRedirect',
+	'beforeError',
+	'beforeRetry',
+
+	// Promise-Only
+	'afterResponse'
+];
 
 type AcceptableResponse = IncomingMessageWithTimings | ResponseLike;
 type AcceptableRequestResult = AcceptableResponse | ClientRequest | Promise<AcceptableResponse | ClientRequest> | undefined;
@@ -118,7 +250,7 @@ export type RequestFunction = (url: URL, options: RequestOptions, callback?: (re
 export type Headers = Record<string, string | string[] | undefined>;
 
 type CacheableRequestFunction = (
-	opts: string | URL | RequestOptions,
+	options: string | URL | RequestOptions,
 	cb?: (response: ServerResponse | ResponseLike) => void
 ) => CacheableRequest.Emitter;
 
@@ -130,46 +262,546 @@ interface RealRequestOptions extends https.RequestOptions {
 	checkServerIdentity: CheckServerIdentityFunction;
 }
 
+export interface RetryObject {
+	attemptCount: number;
+	retryOptions: RequiredRetryOptions;
+	error: TimeoutError | RequestError;
+	computedValue: number;
+	retryAfter?: number;
+}
+
+export type RetryFunction = (retryObject: RetryObject) => number | Promise<number>;
+
+/**
+An object representing `limit`, `calculateDelay`, `methods`, `statusCodes`, `maxRetryAfter` and `errorCodes` fields for maximum retry count, retry handler, allowed methods, allowed status codes, maximum [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) time and allowed error codes.
+
+Delays between retries counts with function `1000 * Math.pow(2, retry) + Math.random() * 100`, where `retry` is attempt number (starts from 1).
+
+The `calculateDelay` property is a `function` that receives an object with `attemptCount`, `retryOptions`, `error` and `computedValue` properties for current retry count, the retry options, error and default computed value.
+The function must return a delay in milliseconds (or a Promise resolving with it) (`0` return value cancels retry).
+
+By default, it retries *only* on the specified methods, status codes, and on these network errors:
+- `ETIMEDOUT`: One of the [timeout](#timeout) limits were reached.
+- `ECONNRESET`: Connection was forcibly closed by a peer.
+- `EADDRINUSE`: Could not bind to any free port.
+- `ECONNREFUSED`: Connection was refused by the server.
+- `EPIPE`: The remote side of the stream being written has been closed.
+- `ENOTFOUND`: Couldn't resolve the hostname to an IP address.
+- `ENETUNREACH`: No internet connection.
+- `EAI_AGAIN`: DNS lookup timed out.
+
+__Note__: If `maxRetryAfter` is set to `undefined`, it will use `options.timeout`.
+__Note__: If [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) header is greater than `maxRetryAfter`, it will cancel the request.
+*/
+export interface RequiredRetryOptions {
+	limit: number;
+	methods: Method[];
+	statusCodes: number[];
+	errorCodes: string[];
+	calculateDelay: RetryFunction;
+	maxRetryAfter?: number;
+}
+
+export interface CacheOptions {
+	shared?: boolean;
+	cacheHeuristic?: number;
+	immutableMinTimeToLive?: number;
+	ignoreCargoCult?: boolean;
+}
+
 interface PlainOptions extends URLOptions {
+	/**
+	Custom request function.
+	The main purpose of this is to [support HTTP2 using a wrapper](https://github.com/szmarczak/http2-wrapper).
+
+	@default http.request | https.request
+	*/
 	request?: RequestFunction;
+
+	/**
+	An object representing `http`, `https` and `http2` keys for [`http.Agent`](https://nodejs.org/api/http.html#http_class_http_agent), [`https.Agent`](https://nodejs.org/api/https.html#https_class_https_agent) and [`http2wrapper.Agent`](https://github.com/szmarczak/http2-wrapper#new-http2agentoptions) instance.
+	This is necessary because a request to one protocol might redirect to another.
+	In such a scenario, Got will switch over to the right protocol agent for you.
+
+	If a key is not present, it will default to a global agent.
+
+	@example
+	```
+	const got = require('got');
+	const HttpAgent = require('agentkeepalive');
+	const {HttpsAgent} = HttpAgent;
+
+	got('https://sindresorhus.com', {
+		agent: {
+			http: new HttpAgent(),
+			https: new HttpsAgent()
+		}
+	});
+	```
+	*/
 	agent?: Agents | false;
+
+	/**
+	Decompress the response automatically.
+	This will set the `accept-encoding` header to `gzip, deflate, br` on Node.js 11.7.0+ or `gzip, deflate` for older Node.js versions, unless you set it yourself.
+
+	Brotli (`br`) support requires Node.js 11.7.0 or later.
+
+	If this is disabled, a compressed response is returned as a `Buffer`.
+	This may be useful if you want to handle decompression yourself or stream the raw compressed data.
+
+	@default true
+	*/
 	decompress?: boolean;
+
+	/**
+	Milliseconds to wait for the server to end the response before aborting the request with `got.TimeoutError` error (a.k.a. `request` property).
+	By default, there's no timeout.
+
+	This also accepts an `object` with the following fields to constrain the duration of each phase of the request lifecycle:
+
+	- `lookup` starts when a socket is assigned and ends when the hostname has been resolved.
+		Does not apply when using a Unix domain socket.
+	- `connect` starts when `lookup` completes (or when the socket is assigned if lookup does not apply to the request) and ends when the socket is connected.
+	- `secureConnect` starts when `connect` completes and ends when the handshaking process completes (HTTPS only).
+	- `socket` starts when the socket is connected. See [request.setTimeout](https://nodejs.org/api/http.html#http_request_settimeout_timeout_callback).
+	- `response` starts when the request has been written to the socket and ends when the response headers are received.
+	- `send` starts when the socket is connected and ends with the request has been written to the socket.
+	- `request` starts when the request is initiated and ends when the response's end event fires.
+	*/
 	timeout?: Delays | number;
+
+	/**
+	When specified, `prefixUrl` will be prepended to `url`.
+	The prefix can be any valid URL, either relative or absolute.
+	A trailing slash `/` is optional - one will be added automatically.
+
+	__Note__: `prefixUrl` will be ignored if the `url` argument is a URL instance.
+
+	__Note__: Leading slashes in `input` are disallowed when using this option to enforce consistency and avoid confusion.
+	For example, when the prefix URL is `https://example.com/foo` and the input is `/bar`, there's ambiguity whether the resulting URL would become `https://example.com/foo/bar` or `https://example.com/bar`.
+	The latter is used by browsers.
+
+	__Tip__: Useful when used with `got.extend()` to create niche-specific Got instances.
+
+	__Tip__: You can change `prefixUrl` using hooks as long as the URL still includes the `prefixUrl`.
+	If the URL doesn't include it anymore, it will throw.
+
+	@example
+	```
+	const got = require('got');
+
+	(async () => {
+		await got('unicorn', {prefixUrl: 'https://cats.com'});
+		//=> 'https://cats.com/unicorn'
+
+		const instance = got.extend({
+			prefixUrl: 'https://google.com'
+		});
+
+		await instance('unicorn', {
+			hooks: {
+				beforeRequest: [
+					options => {
+						options.prefixUrl = 'https://cats.com';
+					}
+				]
+			}
+		});
+		//=> 'https://cats.com/unicorn'
+	})();
+	```
+	*/
 	prefixUrl?: string | URL;
+
+	/**
+	__Note #1__: The `body` option cannot be used with the `json` or `form` option.
+
+	__Note #2__: If you provide this option, `got.stream()` will be read-only.
+
+	__Note #3__: If you provide a payload with the `GET` or `HEAD` method, it will throw a `TypeError` unless the method is `GET` and the `allowGetBody` option is set to `true`.
+
+	__Note #4__: This option is not enumerable and will not be merged with the instance defaults.
+
+	The `content-length` header will be automatically set if `body` is a `string` / `Buffer` / `fs.createReadStream` instance / [`form-data` instance](https://github.com/form-data/form-data), and `content-length` and `transfer-encoding` are not manually set in `options.headers`.
+	*/
 	body?: string | Buffer | Readable;
-	form?: {[key: string]: any};
-	json?: {[key: string]: any};
+
+	/**
+	The form body is converted to a query string using [`(new URLSearchParams(object)).toString()`](https://nodejs.org/api/url.html#url_constructor_new_urlsearchparams_obj).
+
+	If the `Content-Type` header is not present, it will be set to `application/x-www-form-urlencoded`.
+
+	__Note #1__: If you provide this option, `got.stream()` will be read-only.
+
+	__Note #2__: This option is not enumerable and will not be merged with the instance defaults.
+	*/
+	form?: Record<string, any>;
+
+	/**
+	JSON body. If the `Content-Type` header is not set, it will be set to `application/json`.
+
+	__Note #1__: If you provide this option, `got.stream()` will be read-only.
+
+	__Note #2__: This option is not enumerable and will not be merged with the instance defaults.
+	*/
+	json?: Record<string, any>;
+
+	/**
+	The URL to request, as a string, a [`https.request` options object](https://nodejs.org/api/https.html#https_https_request_options_callback), or a [WHATWG `URL`](https://nodejs.org/api/url.html#url_class_url).
+
+	Properties from `options` will override properties in the parsed `url`.
+
+	If no protocol is specified, it will throw a `TypeError`.
+
+	__Note__: The query string is **not** parsed as search params.
+
+	@example
+	```
+	got('https://example.com/?query=a b'); //=> https://example.com/?query=a%20b
+	got('https://example.com/', {searchParams: {query: 'a b'}}); //=> https://example.com/?query=a+b
+
+	// The query string is overridden by `searchParams`
+	got('https://example.com/?query=a b', {searchParams: {query: 'a b'}}); //=> https://example.com/?query=a+b
+	```
+	*/
 	url?: string | URL;
+
+	/**
+	Cookie support. You don't have to care about parsing or how to store them.
+
+	__Note__: If you provide this option, `options.headers.cookie` will be overridden.
+	*/
 	cookieJar?: PromiseCookieJar | ToughCookieJar;
+
+	/**
+	Ignore invalid cookies instead of throwing an error.
+	Only useful when the `cookieJar` option has been set. Not recommended.
+
+	@default false
+	*/
 	ignoreInvalidCookies?: boolean;
-	searchParams?: string | {[key: string]: string | number | boolean | null | undefined} | URLSearchParams;
+
+	/**
+	Query string that will be added to the request URL.
+	This will override the query string in `url`.
+
+	If you need to pass in an array, you can do it using a `URLSearchParams` instance.
+
+	@example
+	```
+	const got = require('got');
+
+	const searchParams = new URLSearchParams([['key', 'a'], ['key', 'b']]);
+
+	got('https://example.com', {searchParams});
+
+	console.log(searchParams.toString());
+	//=> 'key=a&key=b'
+	```
+	*/
+	searchParams?: string | Record<string, string | number | boolean | null | undefined> | URLSearchParams;
+
+	/**
+	An instance of [`CacheableLookup`](https://github.com/szmarczak/cacheable-lookup) used for making DNS lookups.
+	Useful when making lots of requests to different *public* hostnames.
+
+	`CacheableLookup` uses `dns.resolver4(..)` and `dns.resolver6(...)` under the hood and fall backs to `dns.lookup(...)` when the first two fail, which may lead to additional delay.
+
+	__Note__: This should stay disabled when making requests to internal hostnames such as `localhost`, `database.local` etc.
+
+	@default false
+	*/
 	dnsCache?: CacheableLookup | boolean;
+
+	/**
+	User data. `context` is shallow merged and enumerable. If it contains non-enumerable properties they will NOT be merged.
+
+	@example
+	```
+	const got = require('got');
+
+	const instance = got.extend({
+		hooks: {
+			beforeRequest: [
+				options => {
+					if (!options.context || !options.context.token) {
+						throw new Error('Token required');
+					}
+
+					options.headers.token = options.context.token;
+				}
+			]
+		}
+	});
+
+	(async () => {
+		const context = {
+			token: 'secret'
+		};
+
+		const response = await instance('https://httpbin.org/headers', {context});
+
+		// Let's see the headers
+		console.log(response.body);
+	})();
+	```
+	*/
 	context?: Record<string, unknown>;
+
+	/**
+	Hooks allow modifications during the request lifecycle.
+	Hook functions may be async and are run serially.
+	*/
 	hooks?: Hooks;
+
+	/**
+	Defines if redirect responses should be followed automatically.
+
+	Note that if a `303` is sent by the server in response to any request type (`POST`, `DELETE`, etc.), Got will automatically request the resource pointed to in the location header via `GET`.
+	This is in accordance with [the spec](https://tools.ietf.org/html/rfc7231#section-6.4.4).
+
+	@default true
+	*/
 	followRedirect?: boolean;
+
+	/**
+	If exceeded, the request will be aborted and a `MaxRedirectsError` will be thrown.
+
+	@default 10
+	*/
 	maxRedirects?: number;
+
+	/**
+	A cache adapter instance for storing cached response data.
+
+	@default false
+	*/
 	cache?: string | CacheableRequest.StorageAdapter | false;
+
+	/**
+	Determines if a `got.HTTPError` is thrown for unsuccessful responses.
+
+	If this is disabled, requests that encounter an error status code will be resolved with the `response` instead of throwing.
+	This may be useful if you are checking for resource availability and are expecting error responses.
+
+	@default true
+	*/
 	throwHttpErrors?: boolean;
+
 	username?: string;
+
 	password?: string;
+
+	/**
+	If set to `true`, Got will additionally accept HTTP2 requests.
+
+	It will choose either HTTP/1.1 or HTTP/2 depending on the ALPN protocol.
+
+	__Note__: Overriding `options.request` will disable HTTP2 support.
+
+	__Note__: This option will default to `true` in the next upcoming major release.
+
+	@default false
+
+	@example
+	```
+	const got = require('got');
+
+	(async () => {
+		const {headers} = await got('https://nghttp2.org/httpbin/anything', {http2: true});
+		console.log(headers.via);
+		//=> '2 nghttpx'
+	})();
+	```
+	*/
 	http2?: boolean;
+
+	/**
+	Set this to `true` to allow sending body for the `GET` method.
+	However, the [HTTP/2 specification](https://tools.ietf.org/html/rfc7540#section-8.1.3) says that `An HTTP GET request includes request header fields and no payload body`, therefore when using the HTTP/2 protocol this option will have no effect.
+	This option is only meant to interact with non-compliant servers when you have no other choice.
+
+	__Note__: The [RFC 7321](https://tools.ietf.org/html/rfc7231#section-4.3.1) doesn't specify any particular behavior for the GET method having a payload, therefore __it's considered an [anti-pattern](https://en.wikipedia.org/wiki/Anti-pattern)__.
+
+	@default false
+	*/
 	allowGetBody?: boolean;
+
 	lookup?: CacheableLookup['lookup'];
+
+	/**
+	Request headers.
+
+	Existing headers will be overwritten. Headers set to `undefined` will be omitted.
+
+	@default {}
+	*/
 	headers?: Headers;
+
+	/**
+	By default, redirects will use [method rewriting](https://tools.ietf.org/html/rfc7231#section-6.4).
+	For example, when sending a POST request and receiving a `302`, it will resend the body to the new location using the same HTTP method (`POST` in this case).
+
+	@default true
+	*/
 	methodRewriting?: boolean;
+
+	/**
+	Indicates which DNS record family to use.
+
+	Values:
+	- `auto`: IPv4 (if present) or IPv6
+	- `ipv4`: Only IPv4
+	- `ipv6`: Only IPv6
+
+	__Note__: If you are using the undocumented option `family`, `dnsLookupIpVersion` will override it.
+
+	@default 'auto'
+	*/
 	dnsLookupIpVersion?: DnsLookupIpVersion;
+
+	/**
+	A function used to parse JSON responses.
+
+	@example
+	```
+	const got = require('got');
+	const Bourne = require('@hapi/bourne');
+
+	(async () => {
+		const parsed = await got('https://example.com', {
+			parseJson: text => Bourne.parse(text)
+		}).json();
+
+		console.log(parsed);
+	})();
+	```
+	*/
 	parseJson?: ParseJsonFunction;
+
+	/**
+	A function used to stringify the body of JSON requests.
+
+	@example
+	```
+	const got = require('got');
+
+	(async () => {
+		await got.post('https://example.com', {
+			stringifyJson: object => JSON.stringify(object, (key, value) => {
+				if (key.startsWith('_')) {
+					return;
+				}
+
+				return value;
+			}),
+			json: {
+				some: 'payload',
+				_ignoreMe: 1234
+			}
+		});
+	})();
+	```
+
+	@example
+	```
+	const got = require('got');
+
+	(async () => {
+		await got.post('https://example.com', {
+			stringifyJson: object => JSON.stringify(object, (key, value) => {
+				if (typeof value === 'number') {
+					return value.toString();
+				}
+
+				return value;
+			}),
+			json: {
+				some: 'payload',
+				number: 1
+			}
+		});
+	})();
+	```
+	*/
 	stringifyJson?: StringifyJsonFunction;
 
+	/**
+	An object representing `limit`, `calculateDelay`, `methods`, `statusCodes`, `maxRetryAfter` and `errorCodes` fields for maximum retry count, retry handler, allowed methods, allowed status codes, maximum [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) time and allowed error codes.
+
+	Delays between retries counts with function `1000 * Math.pow(2, retry) + Math.random() * 100`, where `retry` is attempt number (starts from 1).
+
+	The `calculateDelay` property is a `function` that receives an object with `attemptCount`, `retryOptions`, `error` and `computedValue` properties for current retry count, the retry options, error and default computed value.
+	The function must return a delay in milliseconds (or a Promise resolving with it) (`0` return value cancels retry).
+
+	By default, it retries *only* on the specified methods, status codes, and on these network errors:
+
+	- `ETIMEDOUT`: One of the [timeout](#timeout) limits were reached.
+	- `ECONNRESET`: Connection was forcibly closed by a peer.
+	- `EADDRINUSE`: Could not bind to any free port.
+	- `ECONNREFUSED`: Connection was refused by the server.
+	- `EPIPE`: The remote side of the stream being written has been closed.
+	- `ENOTFOUND`: Couldn't resolve the hostname to an IP address.
+	- `ENETUNREACH`: No internet connection.
+	- `EAI_AGAIN`: DNS lookup timed out.
+
+	__Note__: If `maxRetryAfter` is set to `undefined`, it will use `options.timeout`.
+	__Note__: If [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After) header is greater than `maxRetryAfter`, it will cancel the request.
+	*/
+	retry?: Partial<RequiredRetryOptions> | number;
+
 	// From `http.RequestOptions`
+	/**
+	The IP address used to send the request from.
+	*/
 	localAddress?: string;
+
 	socketPath?: string;
+
+	/**
+	The HTTP method used to make the request.
+
+	@default 'GET'
+	*/
 	method?: Method;
+
 	createConnection?: (options: http.RequestOptions, oncreate: (error: Error, socket: Socket) => void) => Socket;
 
+	// From `http-cache-semantics`
+	cacheOptions?: CacheOptions;
+
 	// TODO: remove when Got 12 gets released
+	/**
+	If set to `false`, all invalid SSL certificates will be ignored and no error will be thrown.
+
+	If set to `true`, it will throw an error whenever an invalid SSL certificate is detected.
+
+	We strongly recommend to have this set to `true` for security reasons.
+
+	@default true
+
+	@example
+	```
+	const got = require('got');
+
+	(async () => {
+		// Correct:
+		await got('https://example.com', {rejectUnauthorized: true});
+
+		// You can disable it when developing an HTTPS app:
+		await got('https://localhost', {rejectUnauthorized: false});
+
+		// Never do this:
+		await got('https://example.com', {rejectUnauthorized: false});
+	})();
+	```
+	*/
 	rejectUnauthorized?: boolean; // Here for backwards compatibility
 
+	/**
+	Options for the advanced HTTPS API.
+	*/
 	https?: HTTPSOptions;
 }
 
@@ -183,9 +815,45 @@ export interface HTTPSOptions {
 	checkServerIdentity?: CheckServerIdentityFunction;
 
 	// From `tls.SecureContextOptions`
+	/**
+	Override the default Certificate Authorities ([from Mozilla](https://ccadb-public.secure.force.com/mozilla/IncludedCACertificateReport)).
+
+	@example
+	```
+	// Single Certificate Authority
+	got('https://example.com', {
+		https: {
+			certificateAuthority: fs.readFileSync('./my_ca.pem')
+		}
+	});
+	```
+	*/
 	certificateAuthority?: SecureContextOptions['ca'];
+
+	/**
+	Private keys in [PEM](https://en.wikipedia.org/wiki/Privacy-Enhanced_Mail) format.
+
+	[PEM](https://en.wikipedia.org/wiki/Privacy-Enhanced_Mail) allows the option of private keys being encrypted.
+	Encrypted keys will be decrypted with `options.https.passphrase`.
+
+	Multiple keys with different passphrases can be provided as an array of `{pem: <string | Buffer>, passphrase: <string>}`
+	*/
 	key?: SecureContextOptions['key'];
+
+	/**
+	[Certificate chains](https://en.wikipedia.org/wiki/X.509#Certificate_chains_and_cross-certification) in [PEM](https://en.wikipedia.org/wiki/Privacy-Enhanced_Mail) format.
+
+	One cert chain should be provided per private key (`options.https.key`).
+
+	When providing multiple cert chains, they do not have to be in the same order as their private keys in `options.https.key`.
+
+	If the intermediate certificates are not provided, the peer will not be able to validate the certificate, and the handshake will fail.
+	*/
 	certificate?: SecureContextOptions['cert'];
+	
+	/**
+	The passphrase to decrypt the `options.https.key` (if different keys have different passphrases refer to `options.https.key` documentation).
+	*/
 	passphrase?: SecureContextOptions['passphrase'];
 	ciphers?: string;
 	/**
@@ -216,6 +884,7 @@ export interface HTTPSOptions {
 	 * Default: none, see minVersion.
 	 */
 	secureProtocol?: string;
+	pfx?: SecureContextOptions['pfx'];
 }
 
 interface NormalizedPlainOptions extends PlainOptions {
@@ -244,6 +913,8 @@ interface NormalizedPlainOptions extends PlainOptions {
 	password: string;
 	parseJson: ParseJsonFunction;
 	stringifyJson: StringifyJsonFunction;
+	retry: RequiredRetryOptions;
+	cacheOptions: CacheOptions;
 	[kRequest]: HttpRequestFunction;
 	[kIsNormalizedAlready]?: boolean;
 }
@@ -271,6 +942,7 @@ interface PlainDefaults {
 	methodRewriting: boolean;
 	parseJson: ParseJsonFunction;
 	stringifyJson: StringifyJsonFunction;
+	retry: RequiredRetryOptions;
 
 	// Optional
 	agent?: Agents | false;
@@ -279,6 +951,9 @@ interface PlainDefaults {
 	lookup?: CacheableLookup['lookup'];
 	localAddress?: string;
 	createConnection?: Options['createConnection'];
+
+	// From `http-cache-semantics`
+	cacheOptions: CacheOptions;
 }
 
 export interface Defaults extends PromiseOnly.Defaults, PlainDefaults {}
@@ -290,28 +965,168 @@ export interface Progress {
 }
 
 export interface PlainResponse extends IncomingMessageWithTimings {
+	/**
+	The original request URL.
+	*/
 	requestUrl: string;
+
+	/**
+	The redirect URLs.
+	*/
 	redirectUrls: string[];
+
+	/**
+	- `options` - The Got options that were set on this request.
+
+	__Note__: This is not a [http.ClientRequest](https://nodejs.org/api/http.html#http_class_http_clientrequest).
+	*/
 	request: Request;
+
+	/**
+	The remote IP address.
+
+	This is hopefully a temporary limitation, see [lukechilds/cacheable-request#86](https://github.com/lukechilds/cacheable-request/issues/86).
+
+	__Note__: Not available when the response is cached.
+	*/
 	ip?: string;
+
+	/**
+	Whether the response was retrieved from the cache.
+	*/
 	isFromCache: boolean;
+
+	/**
+	The status code of the response.
+	*/
 	statusCode: number;
+
+	/**
+	The request URL or the final URL after redirects.
+	*/
 	url: string;
+
+	/**
+	The object contains the following properties:
+
+	- `start` - Time when the request started.
+	- `socket` - Time when a socket was assigned to the request.
+	- `lookup` - Time when the DNS lookup finished.
+	- `connect` - Time when the socket successfully connected.
+	- `secureConnect` - Time when the socket securely connected.
+	- `upload` - Time when the request finished uploading.
+	- `response` - Time when the request fired `response` event.
+	- `end` - Time when the response fired `end` event.
+	- `error` - Time when the request fired `error` event.
+	- `abort` - Time when the request fired `abort` event.
+	- `phases`
+		- `wait` - `timings.socket - timings.start`
+		- `dns` - `timings.lookup - timings.socket`
+		- `tcp` - `timings.connect - timings.lookup`
+		- `tls` - `timings.secureConnect - timings.connect`
+		- `request` - `timings.upload - (timings.secureConnect || timings.connect)`
+		- `firstByte` - `timings.response - timings.upload`
+		- `download` - `timings.end - timings.response`
+		- `total` - `(timings.end || timings.error || timings.abort) - timings.start`
+
+	If something has not been measured yet, it will be `undefined`.
+
+	__Note__: The time is a `number` representing the milliseconds elapsed since the UNIX epoch.
+	*/
 	timings: Timings;
+
+	/**
+	The number of times the request was retried.
+	*/
+	retryCount: number;
+
+	// Defined only if request errored
+	/**
+	The raw result of the request.
+	*/
+	rawBody?: Buffer;
+
+	/**
+	The result of the request.
+	*/
+	body?: unknown;
 }
 
 // For Promise support
 export interface Response<T = unknown> extends PlainResponse {
+	/**
+	The result of the request.
+	*/
 	body: T;
+
+	/**
+	The raw result of the request.
+	*/
 	rawBody: Buffer;
-	retryCount: number;
 }
 
 export interface RequestEvents<T> {
+	/**
+	`request` event to get the request object of the request.
+
+	 __Tip__: You can use `request` event to abort requests.
+
+	@example
+	```
+	got.stream('https://github.com')
+		.on('request', request => setTimeout(() => request.destroy(), 50));
+	```
+	*/
 	on: ((name: 'request', listener: (request: http.ClientRequest) => void) => T)
+
+	/**
+	The `response` event to get the response object of the final request.
+	*/
 	& (<R extends Response>(name: 'response', listener: (response: R) => void) => T)
+
+	/**
+	The `redirect` event to get the response object of a redirect. The second argument is options for the next request to the redirect location.
+	*/
 	& (<R extends Response, N extends NormalizedOptions>(name: 'redirect', listener: (response: R, nextOptions: N) => void) => T)
-	& ((name: 'uploadProgress' | 'downloadProgress', listener: (progress: Progress) => void) => T);
+
+	/**
+	Progress events for uploading (sending a request) and downloading (receiving a response).
+	The `progress` argument is an object like:
+
+	```js
+	{
+		percent: 0.1,
+		transferred: 1024,
+		total: 10240
+	}
+	```
+
+	If the `content-length` header is missing, `total` will be `undefined`.
+
+	@example
+	```js
+	(async () => {
+		const response = await got('https://sindresorhus.com')
+			.on('downloadProgress', progress => {
+				// Report download progress
+			})
+			.on('uploadProgress', progress => {
+				// Report upload progress
+			});
+
+		console.log(response);
+	})();
+	```
+	*/
+	& ((name: 'uploadProgress' | 'downloadProgress', listener: (progress: Progress) => void) => T)
+	/**
+	To enable retrying on a Got stream, it is required to have a `retry` handler attached.
+
+	When this event is emitted, you should reset the stream you were writing to and prepare the body again.
+
+	See `got.options.retry` for more information.
+	*/
+	& ((name: 'retry', listener: (retryCount: number, error: RequestError) => void) => T);
 }
 
 function validateSearchParameters(searchParameters: Record<string, unknown>): asserts searchParameters is Record<string, string | number | boolean | null | undefined> {
@@ -350,9 +1165,8 @@ const waitForOpenFile = async (file: ReadStream): Promise<void> => new Promise((
 
 const redirectCodes: ReadonlySet<number> = new Set([300, 301, 302, 303, 304, 307, 308]);
 
-type NonEnumerableProperty = 'context' | 'body' | 'json' | 'form';
+type NonEnumerableProperty = 'body' | 'json' | 'form';
 const nonEnumerableProperties: NonEnumerableProperty[] = [
-	'context',
 	'body',
 	'json',
 	'form'
@@ -385,6 +1199,10 @@ export const setNonEnumerableProperties = (sources: Array<Options | Defaults | u
 	Object.defineProperties(to, properties);
 };
 
+/**
+An error to be thrown when a request fails.
+Contains a `code` property with error class code, like `ECONNREFUSED`.
+*/
 export class RequestError extends Error {
 	code?: string;
 	stack!: string;
@@ -429,7 +1247,7 @@ export class RequestError extends Error {
 		this.timings = this.request?.timings;
 
 		// Recover the original stacktrace
-		if (!is.undefined(error.stack)) {
+		if (is.string(error.stack) && is.string(this.stack)) {
 			const indexOfMessage = this.stack.indexOf(this.message) + this.message.length;
 			const thisStackTrace = this.stack.slice(indexOfMessage).split('\n').reverse();
 			const errorStackTrace = error.stack.slice(error.stack.indexOf(error.message!) + error.message!.length).split('\n').reverse();
@@ -444,6 +1262,10 @@ export class RequestError extends Error {
 	}
 }
 
+/**
+An error to be thrown when the server redirects you more than ten times.
+Includes a `response` property.
+*/
 export class MaxRedirectsError extends RequestError {
 	declare readonly response: Response;
 	declare readonly request: Request;
@@ -455,6 +1277,10 @@ export class MaxRedirectsError extends RequestError {
 	}
 }
 
+/**
+An error to be thrown when the server response code is not 2xx nor 3xx if `options.followRedirect` is `true`, but always except for 304.
+Includes a `response` property.
+*/
 export class HTTPError extends RequestError {
 	declare readonly response: Response;
 	declare readonly request: Request;
@@ -465,7 +1291,10 @@ export class HTTPError extends RequestError {
 		this.name = 'HTTPError';
 	}
 }
-
+/**
+An error to be thrown when a cache method fails.
+For example, if the database goes down or there's a filesystem error.
+*/
 export class CacheError extends RequestError {
 	declare readonly request: Request;
 
@@ -475,6 +1304,9 @@ export class CacheError extends RequestError {
 	}
 }
 
+/**
+An error to be thrown when the request body is a stream and an error occurs while reading from that stream.
+*/
 export class UploadError extends RequestError {
 	declare readonly request: Request;
 
@@ -484,6 +1316,10 @@ export class UploadError extends RequestError {
 	}
 }
 
+/**
+An error to be thrown when the request is aborted due to a timeout.
+Includes an `event` and `timings` property.
+*/
 export class TimeoutError extends RequestError {
 	declare readonly request: Request;
 	readonly timings: Timings;
@@ -497,6 +1333,9 @@ export class TimeoutError extends RequestError {
 	}
 }
 
+/**
+An error to be thrown when reading from response stream fails.
+*/
 export class ReadError extends RequestError {
 	declare readonly request: Request;
 	declare readonly response: Response;
@@ -508,6 +1347,9 @@ export class ReadError extends RequestError {
 	}
 }
 
+/**
+An error to be thrown when given an unsupported protocol.
+*/
 export class UnsupportedProtocolError extends RequestError {
 	constructor(options: NormalizedOptions) {
 		super(`Unsupported protocol "${options.url.protocol}"`, {}, options);
@@ -535,6 +1377,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	[kTriggerRead]: boolean;
 	[kBody]: Options['body'];
 	[kJobs]: Array<() => void>;
+	[kRetryTimeout]?: NodeJS.Timeout;
 	[kBodySize]?: number;
 	[kServerResponsesPiped]: Set<ServerResponse>;
 	[kIsFromCache]?: boolean;
@@ -551,9 +1394,13 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	declare requestUrl: string;
 	requestInitialized: boolean;
 	redirects: string[];
+	retryCount: number;
 
-	constructor(url: string | URL, options: Options = {}, defaults?: Defaults) {
+	constructor(url: string | URL | undefined, options: Options = {}, defaults?: Defaults) {
 		super({
+			// This must be false, to enable throwing after destroy
+			// It is used for retry logic in Promise API
+			autoDestroy: false,
 			// It needs to be zero because we're just proxying the data to another stream
 			highWaterMark: 0
 		});
@@ -566,6 +1413,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		this[kStopReading] = false;
 		this[kTriggerRead] = false;
 		this[kJobs] = [];
+		this.retryCount = 0;
 
 		// TODO: Remove this when targeting Node.js >= 12
 		this._progressCallbacks = [];
@@ -603,17 +1451,27 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			this._lockWrite();
 		}
 
-		(async (nonNormalizedOptions: Options) => {
+		if (kIsNormalizedAlready in options) {
+			this.options = options as NormalizedOptions;
+		} else {
 			try {
-				if (nonNormalizedOptions.body instanceof ReadStream) {
-					await waitForOpenFile(nonNormalizedOptions.body);
+				// @ts-expect-error Common TypeScript bug saying that `this.constructor` is not accessible
+				this.options = this.constructor.normalizeArguments(url, options, defaults);
+			} catch (error) {
+				// TODO: Move this to `_destroy()`
+				if (is.nodeStream(options.body)) {
+					options.body.destroy();
 				}
 
-				if (kIsNormalizedAlready in nonNormalizedOptions) {
-					this.options = nonNormalizedOptions as NormalizedOptions;
-				} else {
-					// @ts-expect-error Common TypeScript bug saying that `this.constructor` is not accessible
-					this.options = this.constructor.normalizeArguments(url, nonNormalizedOptions, defaults);
+				this.destroy(error);
+				return;
+			}
+		}
+
+		(async () => {
+			try {
+				if (this.options.body instanceof ReadStream) {
+					await waitForOpenFile(this.options.body);
 				}
 
 				const {url: normalizedURL} = this.options;
@@ -638,6 +1496,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 					job();
 				}
 
+				// Prevent memory leak
+				this[kJobs].length = 0;
+
 				this.requestInitialized = true;
 			} catch (error) {
 				if (error instanceof RequestError) {
@@ -650,7 +1511,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 					this.destroy(error);
 				}
 			}
-		})(options);
+		})();
 	}
 
 	static normalizeArguments(url?: string | URL, options?: Options, defaults?: Defaults): NormalizedOptions {
@@ -706,6 +1567,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		assert.any([isDnsLookupIpVersion, is.undefined], options.dnsLookupIpVersion);
 		assert.any([is.object, is.undefined], options.https);
 		assert.any([is.boolean, is.undefined], options.rejectUnauthorized);
+
 		if (options.https) {
 			assert.any([is.boolean, is.undefined], options.https.rejectUnauthorized);
 			assert.any([is.function_, is.undefined], options.https.checkServerIdentity);
@@ -713,7 +1575,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			assert.any([is.string, is.object, is.array, is.undefined], options.https.key);
 			assert.any([is.string, is.object, is.array, is.undefined], options.https.certificate);
 			assert.any([is.string, is.undefined], options.https.passphrase);
+			assert.any([is.string, is.buffer, is.array, is.undefined], options.https.pfx);
 		}
+
+		assert.any([is.object, is.undefined], options.cacheOptions);
 
 		// `options.method`
 		if (is.string(options.method)) {
@@ -780,14 +1645,14 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		options.password = options.password ?? '';
 
 		// `options.prefixUrl` & `options.url`
-		if (options.prefixUrl) {
+		if (is.undefined(options.prefixUrl)) {
+			options.prefixUrl = defaults?.prefixUrl ?? '';
+		} else {
 			options.prefixUrl = options.prefixUrl.toString();
 
 			if (options.prefixUrl !== '' && !options.prefixUrl.endsWith('/')) {
 				options.prefixUrl += '/';
 			}
-		} else {
-			options.prefixUrl = '';
 		}
 
 		if (is.string(options.url)) {
@@ -801,6 +1666,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 
 		if (options.url) {
+			if ('port' in options) {
+				delete options.port;
+			}
+
 			// Make it possible to change `options.prefixUrl`
 			let {prefixUrl} = options;
 			Object.defineProperty(options, 'prefixUrl', {
@@ -867,9 +1736,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 				options.cookieJar = {
 					setCookie,
-					// TODO: Fix this when upgrading to TypeScript 4.
-					// @ts-expect-error TypeScript thinks that promisifying callback(error, string) will result in Promise<void>
-					getCookieString
+					getCookieString: getCookieString as PromiseCookieJar['getCookieString']
 				};
 			}
 		}
@@ -915,9 +1782,12 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			}
 		}
 
+		// `options.cacheOptions`
+		options.cacheOptions = {...options.cacheOptions};
+
 		// `options.dnsCache`
 		if (options.dnsCache === true) {
-			options.dnsCache = new CacheableLookup();
+			options.dnsCache = globalDnsCache;
 		} else if (!is.undefined(options.dnsCache) && !options.dnsCache.lookup) {
 			throw new TypeError(`Parameter \`dnsCache\` must be a CacheableLookup instance or a boolean, got ${is(options.dnsCache)}`);
 		}
@@ -935,9 +1805,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 
 		// `options.context`
-		if (!options.context) {
-			options.context = {};
-		}
+		options.context = {...defaults?.context, ...options.context};
 
 		// `options.hooks`
 		const areHooksDefault = options.hooks === defaults?.hooks;
@@ -960,7 +1828,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			for (const event of knownHookEvents) {
 				const defaultHooks = defaults.hooks[event];
 
-				if (defaultHooks.length !== 0) {
+				if (defaultHooks.length > 0) {
 					// See https://github.com/microsoft/TypeScript/issues/31445#issuecomment-576929044
 					(options.hooks as any)[event] = [
 						...defaults.hooks[event],
@@ -1004,6 +1872,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			deprecationWarning('"options.passphrase" was never documented, please use "options.https.passphrase"');
 		}
 
+		if ('pfx' in options) {
+			deprecationWarning('"options.pfx" was never documented, please use "options.https.pfx"');
+		}
+
 		// Other options
 		if ('followRedirects' in options) {
 			throw new TypeError('The `followRedirects` option does not exist. Use `followRedirect` instead.');
@@ -1022,7 +1894,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		// Set non-enumerable properties
 		setNonEnumerableProperties([defaults, rawOptions], options);
 
-		return options as NormalizedOptions;
+		return normalizePromiseArguments(options as NormalizedOptions, defaults);
 	}
 
 	_lockWrite(): void {
@@ -1145,6 +2017,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		typedResponse.request = this;
 		typedResponse.isFromCache = (response as any).fromCache || false;
 		typedResponse.ip = this.ip;
+		typedResponse.retryCount = this.retryCount;
 
 		this[kIsFromCache] = typedResponse.isFromCache;
 
@@ -1192,7 +2065,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 		if (options.followRedirect && response.headers.location && redirectCodes.has(statusCode)) {
 			// We're being redirected, we don't care about the response.
-			// It'd be besto to abort the request, but we can't because
+			// It'd be best to abort the request, but we can't because
 			// we would have to sacrifice the TCP connection. We don't want that.
 			response.resume();
 
@@ -1221,6 +2094,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 				if ('form' in options) {
 					delete options.form;
 				}
+
+				this[kBody] = undefined;
+				delete options.headers['content-length'];
 			}
 
 			if (this.redirects.length >= options.maxRedirects) {
@@ -1238,7 +2114,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 				decodeURI(redirectString);
 
 				// Redirecting to a different site, clear sensitive data.
-				if (redirectUrl.hostname !== url.hostname) {
+				if (redirectUrl.hostname !== url.hostname || redirectUrl.port !== url.port) {
 					if ('host' in options.headers) {
 						delete options.headers.host;
 					}
@@ -1252,9 +2128,12 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 					}
 
 					if (options.username || options.password) {
-						delete options.username;
-						delete options.password;
+						options.username = '';
+						options.password = '';
 					}
+				} else {
+					redirectUrl.username = options.username;
+					redirectUrl.password = options.password;
 				}
 
 				this.redirects.push(redirectString);
@@ -1276,17 +2155,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			return;
 		}
 
-		const limitStatusCode = options.followRedirect ? 299 : 399;
-		const isOk = (statusCode >= 200 && statusCode <= limitStatusCode) || statusCode === 304;
-		if (options.throwHttpErrors && !isOk) {
-			// Normally we would have to use `void [await] this._beforeError(error)` everywhere,
-			// but since there's `void (async () => { ... })()` inside of it, we don't have to.
+		if (options.isStream && options.throwHttpErrors && !isResponseOk(typedResponse)) {
 			this._beforeError(new HTTPError(typedResponse));
-
-			// This is equivalent to this.destroyed
-			if (this[kStopReading]) {
-				return;
-			}
+			return;
 		}
 
 		response.on('readable', () => {
@@ -1332,6 +2203,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		try {
 			await this._onResponseBase(response);
 		} catch (error) {
+			/* istanbul ignore next: better safe than sorry */
 			this._beforeError(error);
 		}
 	}
@@ -1357,11 +2229,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			// Node.js <= 12.18.2 mistakenly emits the response `end` first.
 			(request as ClientRequest & {res: IncomingMessage | undefined}).res?.removeAllListeners('end');
 
-			if (error instanceof TimedOutTimeoutError) {
-				error = new TimeoutError(error, this.timings!, this);
-			} else {
-				error = new RequestError(error.message, error, this);
-			}
+			error = error instanceof TimedOutTimeoutError ? new TimeoutError(error, this.timings!, this) : new RequestError(error.message, error, this);
 
 			this._beforeError(error as RequestError);
 		});
@@ -1380,10 +2248,6 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			body.pipe(currentRequest);
 			body.once('error', (error: NodeJS.ErrnoException) => {
 				this._beforeError(new UploadError(error, this));
-			});
-
-			body.once('end', () => {
-				delete options.body;
 			});
 		} else {
 			this._unlockWrite();
@@ -1409,6 +2273,8 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			Object.assign(options, urlToOptions(url));
 
 			// `http-cache-semantics` checks this
+			// TODO: Fix this ignore.
+			// @ts-expect-error
 			delete (options as unknown as NormalizedOptions).url;
 
 			let request: ClientRequest | Promise<ClientRequest>;
@@ -1474,6 +2340,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			}
 		}
 
+		if (options.body && this[kBody] !== options.body) {
+			this[kBody] = options.body;
+		}
+
 		const {agent, request, timeout, url} = options;
 
 		if (options.dnsCache && !('lookup' in options)) {
@@ -1518,9 +2388,15 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		// Prepare plain HTTP request options
 		options[kRequest] = realFn as HttpRequestFunction;
 		delete options.request;
+		// TODO: Fix this ignore.
+		// @ts-expect-error
 		delete options.timeout;
 
-		const requestOptions = options as unknown as RealRequestOptions;
+		const requestOptions = options as unknown as (RealRequestOptions & CacheOptions);
+		requestOptions.shared = options.cacheOptions?.shared;
+		requestOptions.cacheHeuristic = options.cacheOptions?.cacheHeuristic;
+		requestOptions.immutableMinTimeToLive = options.cacheOptions?.immutableMinTimeToLive;
+		requestOptions.ignoreCargoCult = options.cacheOptions?.ignoreCargoCult;
 
 		// If `dnsLookupIpVersion` is not present do not override `family`
 		if (options.dnsLookupIpVersion !== undefined) {
@@ -1576,6 +2452,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			if (options.https.secureProtocol) {
 				requestOptions.secureProtocol = options.https.secureProtocol;
 			}
+
+			if (options.https.pfx) {
+				requestOptions.pfx = options.https.pfx;
+			}
 		}
 
 		try {
@@ -1589,6 +2469,38 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			options.request = request;
 			options.timeout = timeout;
 			options.agent = agent;
+
+			// HTTPS options restore
+			if (options.https) {
+				if ('rejectUnauthorized' in options.https) {
+					delete requestOptions.rejectUnauthorized;
+				}
+
+				if (options.https.checkServerIdentity) {
+					// @ts-expect-error - This one will be removed when we remove the alias.
+					delete requestOptions.checkServerIdentity;
+				}
+
+				if (options.https.certificateAuthority) {
+					delete requestOptions.ca;
+				}
+
+				if (options.https.certificate) {
+					delete requestOptions.cert;
+				}
+
+				if (options.https.key) {
+					delete requestOptions.key;
+				}
+
+				if (options.https.passphrase) {
+					delete requestOptions.passphrase;
+				}
+
+				if (options.https.pfx) {
+					delete requestOptions.pfx;
+				}
+			}
 
 			if (isClientRequest(requestOrResponse)) {
 				this._onRequest(requestOrResponse);
@@ -1614,10 +2526,26 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		}
 	}
 
+	async _error(error: RequestError): Promise<void> {
+		try {
+			for (const hook of this.options.hooks.beforeError) {
+				// eslint-disable-next-line no-await-in-loop
+				error = await hook(error);
+			}
+		} catch (error_) {
+			error = new RequestError(error_.message, error_, this);
+		}
+
+		this.destroy(error);
+	}
+
 	_beforeError(error: Error): void {
-		if (this.destroyed) {
+		if (this[kStopReading]) {
 			return;
 		}
+
+		const {options} = this;
+		const retryCount = this.retryCount + 1;
 
 		this[kStopReading] = true;
 
@@ -1625,28 +2553,82 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 			error = new RequestError(error.message, error, this);
 		}
 
+		const typedError = error as RequestError;
+		const {response} = typedError;
+
 		void (async () => {
-			try {
-				const {response} = error as RequestError;
+			if (response && !response.body) {
+				response.setEncoding((this as any)._readableState.encoding);
 
-				if (response) {
-					response.setEncoding((this as any)._readableState.encoding);
-
+				try {
 					response.rawBody = await getBuffer(response);
 					response.body = response.rawBody.toString();
-				}
-			} catch {}
-
-			try {
-				for (const hook of this.options.hooks.beforeError) {
-					// eslint-disable-next-line no-await-in-loop
-					error = await hook(error as RequestError);
-				}
-			} catch (error_) {
-				error = new RequestError(error_.message, error_, this);
+				} catch {}
 			}
 
-			this.destroy(error);
+			if (this.listenerCount('retry') !== 0) {
+				let backoff: number;
+
+				try {
+					let retryAfter;
+					if (response && 'retry-after' in response.headers) {
+						retryAfter = Number(response.headers['retry-after']);
+						if (Number.isNaN(retryAfter)) {
+							retryAfter = Date.parse(response.headers['retry-after']!) - Date.now();
+
+							if (retryAfter <= 0) {
+								retryAfter = 1;
+							}
+						} else {
+							retryAfter *= 1000;
+						}
+					}
+
+					backoff = await options.retry.calculateDelay({
+						attemptCount: retryCount,
+						retryOptions: options.retry,
+						error: typedError,
+						retryAfter,
+						computedValue: calculateRetryDelay({
+							attemptCount: retryCount,
+							retryOptions: options.retry,
+							error: typedError,
+							retryAfter,
+							computedValue: 0
+						})
+					});
+				} catch (error_) {
+					void this._error(new RequestError(error_.message, error_, this));
+					return;
+				}
+
+				if (backoff) {
+					const retry = async (): Promise<void> => {
+						try {
+							for (const hook of this.options.hooks.beforeRetry) {
+								// eslint-disable-next-line no-await-in-loop
+								await hook(this.options, typedError, retryCount);
+							}
+						} catch (error_) {
+							void this._error(new RequestError(error_.message, error, this));
+							return;
+						}
+
+						// Something forced us to abort the retry
+						if (this.destroyed) {
+							return;
+						}
+
+						this.destroy();
+						this.emit('retry', retryCount, error);
+					};
+
+					this[kRetryTimeout] = setTimeout(retry, backoff);
+					return;
+				}
+			}
+
+			void this._error(typedError);
 		})();
 	}
 
@@ -1691,6 +2673,11 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	}
 
 	_writeRequest(chunk: any, encoding: BufferEncoding | undefined, callback: (error?: Error | null) => void): void {
+		if (this[kRequest]!.destroyed) {
+			// Probably the `ClientRequest` instance will throw
+			return;
+		}
+
 		this._progressCallbacks.push((): void => {
 			this[kUploadedSize] += Buffer.byteLength(chunk, encoding);
 
@@ -1704,7 +2691,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		// TODO: What happens if it's from cache? Then this[kRequest] won't be defined.
 
 		this[kRequest]!.write(chunk, encoding!, (error?: Error | null) => {
-			if (!error && this._progressCallbacks.length !== 0) {
+			if (!error && this._progressCallbacks.length > 0) {
 				this._progressCallbacks.shift()!();
 			}
 
@@ -1753,6 +2740,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 	_destroy(error: Error | null, callback: (error: Error | null) => void): void {
 		this[kStopReading] = true;
 
+		// Prevent further retries
+		clearTimeout(this[kRetryTimeout] as NodeJS.Timeout);
+
 		if (kRequest in this) {
 			this[kCancelTimeouts]!();
 
@@ -1770,18 +2760,31 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		callback(error);
 	}
 
-	get ip(): string | undefined {
-		return this[kRequest]?.socket.remoteAddress;
+	get _isAboutToError() {
+		return this[kStopReading];
 	}
 
+	/**
+	The remote IP address.
+	*/
+	get ip(): string | undefined {
+		return this.socket?.remoteAddress;
+	}
+
+	/**
+	Indicates whether the request has been aborted or not.
+	*/
 	get aborted(): boolean {
 		return (this[kRequest]?.destroyed ?? this.destroyed) && !(this[kOriginalResponse]?.complete);
 	}
 
 	get socket(): Socket | undefined {
-		return this[kRequest]?.socket;
+		return this[kRequest]?.socket ?? undefined;
 	}
 
+	/**
+	Progress event for downloading (receiving a response).
+	*/
 	get downloadProgress(): Progress {
 		let percent;
 		if (this[kResponseSize]) {
@@ -1799,6 +2802,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		};
 	}
 
+	/**
+	Progress event for uploading (sending a request).
+	*/
 	get uploadProgress(): Progress {
 		let percent;
 		if (this[kBodySize]) {
@@ -1816,16 +2822,42 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 		};
 	}
 
+	/**
+	The object contains the following properties:
+
+	- `start` - Time when the request started.
+	- `socket` - Time when a socket was assigned to the request.
+	- `lookup` - Time when the DNS lookup finished.
+	- `connect` - Time when the socket successfully connected.
+	- `secureConnect` - Time when the socket securely connected.
+	- `upload` - Time when the request finished uploading.
+	- `response` - Time when the request fired `response` event.
+	- `end` - Time when the response fired `end` event.
+	- `error` - Time when the request fired `error` event.
+	- `abort` - Time when the request fired `abort` event.
+	- `phases`
+		- `wait` - `timings.socket - timings.start`
+		- `dns` - `timings.lookup - timings.socket`
+		- `tcp` - `timings.connect - timings.lookup`
+		- `tls` - `timings.secureConnect - timings.connect`
+		- `request` - `timings.upload - (timings.secureConnect || timings.connect)`
+		- `firstByte` - `timings.response - timings.upload`
+		- `download` - `timings.end - timings.response`
+		- `total` - `(timings.end || timings.error || timings.abort) - timings.start`
+
+	If something has not been measured yet, it will be `undefined`.
+
+	__Note__: The time is a `number` representing the milliseconds elapsed since the UNIX epoch.
+	*/
 	get timings(): Timings | undefined {
 		return (this[kRequest] as ClientRequestWithTimings)?.timings;
 	}
 
+	/**
+	Whether the response was retrieved from the cache.
+	*/
 	get isFromCache(): boolean | undefined {
 		return this[kIsFromCache];
-	}
-
-	get _response(): Response | undefined {
-		return this[kResponse] as Response;
 	}
 
 	pipe<T extends NodeJS.WritableStream>(destination: T, options?: {end?: boolean}): T {

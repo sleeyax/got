@@ -97,12 +97,12 @@ test('methods are normalized', withServer, async (t, server, got) => {
 	await instance('test', {method: 'post'});
 });
 
-test.failing('throws an error when legacy URL is passed', withServer, async (t, server, got) => {
+test.failing('throws an error when legacy URL is passed', withServer, async (t, server) => {
 	server.get('/test', echoUrl);
 
 	await t.throwsAsync(
 		// @ts-expect-error Error tests
-		got(parse(`${server.url}/test`), {prefixUrl: ''}),
+		got(parse(`${server.url}/test`)),
 		{message: 'The legacy `url.Url` has been deprecated. Use `URL` instead.'}
 	);
 
@@ -110,22 +110,20 @@ test.failing('throws an error when legacy URL is passed', withServer, async (t, 
 		got({
 			protocol: 'http:',
 			hostname: 'localhost',
-			port: server.port,
-			prefixUrl: ''
+			port: server.port
 		}),
 		{message: 'The legacy `url.Url` has been deprecated. Use `URL` instead.'}
 	);
 });
 
-test('accepts legacy URL options', withServer, async (t, server, got) => {
+test('accepts legacy URL options', withServer, async (t, server) => {
 	server.get('/test', echoUrl);
 
 	const {body: secondBody} = await got({
 		protocol: 'http:',
 		hostname: 'localhost',
 		port: server.port,
-		pathname: '/test',
-		prefixUrl: ''
+		pathname: '/test'
 	});
 
 	t.is(secondBody, '/test');
@@ -330,7 +328,7 @@ test('throws if the `searchParams` value is invalid', async t => {
 	});
 });
 
-test('`context` option is not enumerable', withServer, async (t, server, got) => {
+test('`context` option is enumerable', withServer, async (t, server, got) => {
 	server.get('/', echoUrl);
 
 	const context = {
@@ -342,8 +340,8 @@ test('`context` option is not enumerable', withServer, async (t, server, got) =>
 		hooks: {
 			beforeRequest: [
 				options => {
-					t.is(options.context, context);
-					t.false({}.propertyIsEnumerable.call(options, 'context'));
+					t.deepEqual(options.context, context);
+					t.true({}.propertyIsEnumerable.call(options, 'context'));
 				}
 			]
 		}
@@ -362,8 +360,8 @@ test('`context` option is accessible when using hooks', withServer, async (t, se
 		hooks: {
 			beforeRequest: [
 				options => {
-					t.is(options.context, context);
-					t.false({}.propertyIsEnumerable.call(options, 'context'));
+					t.deepEqual(options.context, context);
+					t.true({}.propertyIsEnumerable.call(options, 'context'));
 				}
 			]
 		}
@@ -377,8 +375,27 @@ test('`context` option is accessible when extending instances', t => {
 
 	const instance = got.extend({context});
 
-	t.is(instance.defaults.options.context, context);
-	t.false({}.propertyIsEnumerable.call(instance.defaults.options, 'context'));
+	t.deepEqual(instance.defaults.options.context, context);
+	t.true({}.propertyIsEnumerable.call(instance.defaults.options, 'context'));
+});
+
+test('`context` option is shallow merged', t => {
+	const context = {
+		foo: 'bar'
+	};
+
+	const context2 = {
+		bar: 'baz'
+	};
+
+	const instance1 = got.extend({context});
+
+	t.deepEqual(instance1.defaults.options.context, context);
+	t.true({}.propertyIsEnumerable.call(instance1.defaults.options, 'context'));
+
+	const instance2 = instance1.extend({context: context2});
+
+	t.deepEqual(instance2.defaults.options.context, {...context, ...context2});
 });
 
 test('throws if `options.encoding` is `null`', async t => {
