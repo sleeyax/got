@@ -14,8 +14,8 @@
 
 > Human-friendly and powerful HTTP request library for Node.js
 
-[![Build Status: Linux](https://travis-ci.com/sindresorhus/got.svg?branch=master)](https://travis-ci.com/github/sindresorhus/got)
-[![Coverage Status](https://coveralls.io/repos/github/sindresorhus/got/badge.svg?branch=master)](https://coveralls.io/github/sindresorhus/got?branch=master)
+[![Build Status](https://github.com/sindresorhus/got/workflows/CI/badge.svg?branch=master)](https://github.com/sindresorhus/got/actions?query=branch%3Amaster+workflow%3ACI)
+[![Coverage Status](https://codecov.io/gh/sindresorhus/got/branch/master/graph/badge.svg)](https://codecov.io/gh/sindresorhus/got/branch/master)
 [![Downloads](https://img.shields.io/npm/dm/got.svg)](https://npmjs.com/got)
 [![Install size](https://packagephobia.now.sh/badge?p=got)](https://packagephobia.now.sh/result?p=got)
 
@@ -236,7 +236,9 @@ Type: `string | Buffer | stream.Readable` or [`form-data` instance](https://gith
 
 **Note #4:** This option is not enumerable and will not be merged with the instance defaults.
 
-The `content-length` header will be automatically set if `body` is a `string` / `Buffer` / `fs.createReadStream` instance / [`form-data` instance](https://github.com/form-data/form-data), and `content-length` and `transfer-encoding` are not manually set in `options.headers`.
+The `content-length` header will be automatically set if `body` is a `string` / `Buffer` / [`form-data` instance](https://github.com/form-data/form-data), and `content-length` and `transfer-encoding` are not manually set in `options.headers`.
+
+Since Got 12, the `content-length` is not automatically set when `body` is a `fs.createReadStream`.
 
 ###### json
 
@@ -519,7 +521,7 @@ Delays between retries counts with function `1000 * Math.pow(2, retry - 1) + Mat
 
 The `calculateDelay` property is a `function` that receives an object with `attemptCount`, `retryOptions`, `error` and `computedValue` properties for current retry count, the retry options, error and default computed value. The function must return a delay in milliseconds (or a Promise resolving with it) (`0` return value cancels retry).
 
-**Note:** The `calculateDelay` function is responsible for the entire cache mechanism, including the `limit` property. To support it, you need to check whether `computedValue` is different than `0`.
+**Note:** The `calculateDelay` function is responsible for the entire retry mechanism, including the `limit` property. To support the `limit` property, you need to check whether `computedValue` is different than `0`.
 
 By default, it retries *only* on the specified methods, status codes, and on these network errors:
 - `ETIMEDOUT`: One of the [timeout](#timeout) limits were reached.
