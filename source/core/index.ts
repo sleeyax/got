@@ -31,7 +31,7 @@ import normalizePromiseArguments from '../as-promise/normalize-arguments';
 import {PromiseOnly} from '../as-promise/types';
 import calculateRetryDelay from './calculate-retry-delay';
 
-const globalDnsCache = new CacheableLookup();
+let globalDnsCache: CacheableLookup;
 
 type HttpRequestFunction = typeof httpRequest;
 type Error = NodeJS.ErrnoException;
@@ -423,7 +423,9 @@ interface PlainOptions extends URLOptions {
 
 	__Note #4__: This option is not enumerable and will not be merged with the instance defaults.
 
-	The `content-length` header will be automatically set if `body` is a `string` / `Buffer` / `fs.createReadStream` instance / [`form-data` instance](https://github.com/form-data/form-data), and `content-length` and `transfer-encoding` are not manually set in `options.headers`.
+	The `content-length` header will be automatically set if `body` is a `string` / `Buffer` / [`form-data` instance](https://github.com/form-data/form-data), and `content-length` and `transfer-encoding` are not manually set in `options.headers`.
+
+	Since Got 12, the `content-length` is not automatically set when `body` is a `fs.createReadStream`.
 	*/
 	body?: string | Buffer | Readable;
 
@@ -1787,6 +1789,10 @@ export default class Request extends Duplex implements RequestEvents<Request> {
 
 		// `options.dnsCache`
 		if (options.dnsCache === true) {
+			if (!globalDnsCache) {
+				globalDnsCache = new CacheableLookup();
+			}
+
 			options.dnsCache = globalDnsCache;
 		} else if (!is.undefined(options.dnsCache) && !options.dnsCache.lookup) {
 			throw new TypeError(`Parameter \`dnsCache\` must be a CacheableLookup instance or a boolean, got ${is(options.dnsCache)}`);
